@@ -1204,12 +1204,15 @@ moves_loop:  // When in check, search starts here
         if ((ss + 1)->cutoffCnt > 2)
             r += 1036 + allNode * 848;
 
-        if (!capture && !givesCheck && ss->quietMoveStreak >= 2) 
-            r += (ss->quietMoveStreak - 1) * 50;
-
         // For first picked move (ttMove) reduce reduction
         else if (ss->isTTMove)
             r -= 2006;
+
+        if (!capture && !givesCheck && ss->quietMoveStreak >= 2){
+            //extension++;
+            const int logDepth = 31 - __builtin_clz(depth);
+            r += std::min(2000, (ss->quietMoveStreak - 1) * logDepth * 50);
+        }
 
         if (capture)
             ss->statScore =
