@@ -29,6 +29,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <list>
+#include <vector>
 #include <ratio>
 #include <string>
 #include <utility>
@@ -280,6 +281,40 @@ void Search::Worker::iterative_deepening() {
     size_t multiPV = size_t(options["MultiPV"]);
     Skill skill(options["Skill Level"], options["UCI_LimitStrength"] ? int(options["UCI_Elo"]) : 0);
 
+    // ---- Root Bandit Scheduler (UCB/PUCT) ------------------------------
+    // OFF by default; enabled with setoption name RootBandit value true
+    const bool useRootBandit = bool(options["RootBandit"]);
+    std::vector<double> rbPrior, rbN, rbQ;
+
+    auto rb_reset_if_needed = [&]() {
+        if (!useRootBandit) return;
+        if (rbPrior.size() != rootMoves.size()) {
+            rbPrior.assign(rootMoves.size(), rootMoves.empty() ? 0.0 : 1.0 / double(rootMoves.size()));
+            rbN.assign(rootMoves.size(), 0.0);
+            rbQ.assign(rootMoves.size(), 0.0);
+        }
+    };
+    auto rb_rotate_front = [&](size_t idx) {
+        if (!useRootBandit || idx == 0 || idx >= rootMoves.size()) return;
+        std::rotate(rootMoves.begin(), rootMoves.begin() + idx, rootMoves.begin() + idx + 1);
+        std::rotate(rbPrior.begin(),    rbPrior.begin() + idx,    rbPrior.begin() + idx + 1);
+        std::rotate(rbN.begin(),        rbN.begin() + idx,        rbN.begin() + idx + 1);
+        std::rotate(rbQ.begin(),        rbQ.begin() + idx,        rbQ.begin() + idx + 1);
+    };
+    auto rb_pick_ucb = [&]() -> size_t {
+        // Uniform prior for now; later, plug a policy head to fill rbPrior.
+        double totalN = 0.0; for (double v : rbN) totalN += v;
+        const double Cpuct = 1.40; // tune in testing
+        size_t best = 0; double bestScore = -1e300;
+        for (size_t i = 0; i < rootMoves.size(); ++i) {
+            const double U = Cpuct * rbPrior[i] * std::sqrt(totalN + 1.0) / (1.0 + rbN[i]);
+            const double score = rbQ[i] + U;
+            if (score > bestScore) { bestScore = score; best = i; }
+        }
+        return best;
+    };
+    // -------------------------------------------------------------------
+
     // When playing with strength handicap enable MultiPV search that we will
     // use behind-the-scenes to retrieve a set of possible moves.
     if (skill.enabled())
@@ -295,6 +330,8 @@ void Search::Worker::iterative_deepening() {
     while (++rootDepth < MAX_PLY && !threads.stop
            && !(limits.depth && mainThread && rootDepth > limits.depth))
     {
+        if (useRootBandit) rb_reset_if_needed();
+
         // Age out PV variability metric
         if (mainThread)
             totBestMoveChanges /= 2;
@@ -313,6 +350,16 @@ void Search::Worker::iterative_deepening() {
         // MultiPV loop. We perform a full root search for each PV line
         for (pvIdx = 0; pvIdx < multiPV; ++pvIdx)
         {
+            // For MultiPV==1, choose one root move to deepen using UCB/PUCT.
+            // We bring the chosen move (and its stats) to the front (index 0).
+            if (useRootBandit && multiPV == 1 && rootMoves.size() > 1)
+            {
+                const size_t chosen = rb_pick_ucb();
+                rb_rotate_front(chosen);
+            }
+            // With bandit enabled and MultiPV==1, we restrict the searched set
+            // to the single chosen move by clamping pvLast below.
+
             if (pvIdx == pvLast)
             {
                 pvFirst = pvLast;
@@ -320,6 +367,9 @@ void Search::Worker::iterative_deepening() {
                     if (rootMoves[pvLast].tbRank != rootMoves[pvFirst].tbRank)
                         break;
             }
+
+            if (useRootBandit && multiPV == 1)
+                pvLast = pvIdx + 1; // search only the selected front move this iteration
 
             // Reset UCI info selDepth for each depth and each PV line
             selDepth = 0;
@@ -390,6 +440,17 @@ void Search::Worker::iterative_deepening() {
                 delta += delta / 3;
 
                 assert(alpha >= -VALUE_INFINITE && beta <= VALUE_INFINITE);
+            }
+
+            // Bandit feedback: update Q,N for the chosen front move (index 0)
+            if (useRootBandit && multiPV == 1 && !threads.stop && !rootMoves.empty())
+            {
+                // Map centipawn to [-1,1] with a gentle temperature (600 cp).
+                // Avoid pushing decisive TB/mate scores too hard; tanh smooths them.
+                double q = std::tanh(double(bestValue) / 600.0);
+                // Simple EMA for stability.
+                rbQ[0] = 0.7 * rbQ[0] + 0.3 * q;
+                rbN[0] += 1.0;
             }
 
             // Sort the PV lines searched so far and update the GUI

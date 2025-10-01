@@ -100,6 +100,9 @@ Engine::Engine(std::optional<std::string> path) :
     options.add(  //
       "MultiPV", Option(1, 1, MAX_MOVES));
 
+    // Root move scheduling via UCB/PUCT (MultiPV=1 only)
+    options.add("RootBandit", Option(true));
+
     options.add("Skill Level", Option(20, 0, 20));
 
     options.add("Move Overhead", Option(10, 0, 5000));
