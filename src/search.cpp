@@ -281,16 +281,17 @@ void Search::Worker::iterative_deepening() {
     size_t multiPV = size_t(options["MultiPV"]);
     Skill skill(options["Skill Level"], options["UCI_LimitStrength"] ? int(options["UCI_Elo"]) : 0);
 
-    // ---- Root Bandit Scheduler (UCB/PUCT) ------------------------------
-    // OFF by default; enabled with setoption name RootBandit value true
+    // ---- Root Bandit Scheduler (UCB/PUCT) with Composite Prior ---------
+    // RootBandit is ON by default in your engine.cpp.
     const bool useRootBandit = bool(options["RootBandit"]);
     std::vector<double> rbPrior, rbN, rbQ;
     std::vector<Move>   rbOrderBeforeSort;
+    Move                rbChosenMove = Move::none();
 
     auto rb_reset_if_needed = [&]() {
         if (!useRootBandit) return;
         if (rbPrior.size() != rootMoves.size()) {
-            rbPrior.assign(rootMoves.size(), rootMoves.empty() ? 0.0 : 1.0 / double(rootMoves.size()));
+            rbPrior.assign(rootMoves.size(), 0.0);
             rbN.assign(rootMoves.size(), 0.0);
             rbQ.assign(rootMoves.size(), 0.0);
         }
@@ -326,12 +327,79 @@ void Search::Worker::iterative_deepening() {
             if (j < rbOrderBeforeSort.size()) {
                 p2[i] = rbPrior[j]; n2[i] = rbN[j]; q2[i] = rbQ[j];
             } else {
-                // New/unknown move: initialize conservatively
-                p2[i] = rootMoves.empty() ? 0.0 : 1.0 / double(rootMoves.size());
-                n2[i] = 0.0; q2[i] = 0.0;
+                // new/unknown: init conservatively (will get normalized below)
+                p2[i] = 0.0; n2[i] = 0.0; q2[i] = 0.0;
             }
         }
         rbPrior.swap(p2); rbN.swap(n2); rbQ.swap(q2);
+    };
+    // Fill a composite, cheap prior over root moves (no node counting, no restriction)
+    auto rb_fill_priors = [&]() {
+        if (!useRootBandit || rootMoves.empty()) return;
+        // Probe TT once for ttMove feature
+        Move ttMove = Move::none();
+        {
+            auto [ttHit, ttData, ttWriter] = tt.probe(rootPos.key());
+            if (ttHit) ttMove = ttData.move;
+        }
+        Color us = rootPos.side_to_move();
+        // Bonus if we still have a best PV from the last iteration
+        Move lastPV0 = Move::none();
+        // We can look at the top PV if available
+        if (!rootMoves.empty() && rootMoves[0].pv[0] != Move::none())
+            lastPV0 = rootMoves[0].pv[0];
+
+        // Build raw scores
+        std::vector<double> raw(rootMoves.size(), 0.0);
+        double maxv = -1e300;
+        for (size_t i = 0; i < rootMoves.size(); ++i) {
+            Move m = rootMoves[i].pv[0];
+            // Features (all cheap):
+            const bool isTT   = (m == ttMove);
+            const bool cap    = rootPos.capture_stage(m);
+            const bool chk    = rootPos.gives_check(m);
+            const bool promo  = (m.type_of() == PROMOTION);
+            const bool see_ge0= cap ? rootPos.see_ge(m, 0) : true; // quiets treated neutral
+            // History / capture stats (scaled down)
+            int mh = mainHistory[us][m.from_to()];
+            double mhTerm = mh / 8192.0;        // ~[-? , ?] -> small number
+            double capTerm = 0.0;
+            if (cap) {
+                PieceType captured = type_of(rootPos.piece_on(m.to_sq()));
+                capTerm = captureHistory[rootPos.moved_piece(m)][m.to_sq()][captured] / 4096.0;
+            }
+            // Last PV continuity bonus
+            const bool wasPV = (m == lastPV0);
+            // Compose score (weights are modest, conservative)
+            double s = 0.0;
+            s += isTT   ?  2.0 : 0.0;
+            s += cap    ? (see_ge0 ? 0.9 : -0.4) : 0.0;
+            s += chk    ?  0.3 : 0.0;
+            s += promo  ?  0.6 : 0.0;
+            s += mhTerm * 0.6;
+            s += capTerm * 0.3;
+            s += wasPV  ?  0.25 : 0.0;
+            raw[i] = s;
+            if (s > maxv) maxv = s;
+        }
+        // Softmax with small temperature, mixed with epsilon-uniform
+        const double tau = 0.75;
+        const double eps = 0.10; // keep some uniform to avoid peaky priors
+        double Z = 0.0;
+        for (size_t i = 0; i < raw.size(); ++i) {
+            rbPrior[i] = std::exp((raw[i] - maxv) / tau);
+            Z += rbPrior[i];
+        }
+        if (Z <= 0.0) {
+            // fallback to uniform
+            for (size_t i = 0; i < rbPrior.size(); ++i)
+                rbPrior[i] = 1.0 / double(rbPrior.size());
+        } else {
+            for (size_t i = 0; i < rbPrior.size(); ++i) {
+                double p = rbPrior[i] / Z;
+                rbPrior[i] = (1.0 - eps) * p + eps / double(rbPrior.size());
+            }
+        }
     };
     // -------------------------------------------------------------------
 
@@ -351,6 +419,7 @@ void Search::Worker::iterative_deepening() {
            && !(limits.depth && mainThread && rootDepth > limits.depth))
     {
         if (useRootBandit) rb_reset_if_needed();
+        if (useRootBandit) rb_fill_priors();
 
         // Age out PV variability metric
         if (mainThread)
@@ -376,6 +445,7 @@ void Search::Worker::iterative_deepening() {
             {
                 const size_t chosen = rb_pick_ucb();
                 rb_rotate_front(chosen);
+                rbChosenMove = rootMoves[0].pv[0]; // remember which move we chose
             }
             // IMPORTANT: Do *not* clamp the searched slice (pvFirst..pvLast).
             // Stockfish uses that slice to implement UCI `searchmoves`. Clamping it to
@@ -472,13 +542,22 @@ void Search::Worker::iterative_deepening() {
                 assert(alpha >= -VALUE_INFINITE && beta <= VALUE_INFINITE);
             }
 
-            // Root bandit feedback: update Q,N for the chosen move (now at index 0)
-            if (useRootBandit && multiPV == 1 && !threads.stop && !is_decisive(bestValue) && !rootMoves.empty())
+            // Root bandit feedback: update stats for the move we actually chose
+            if (useRootBandit && multiPV == 1 && !threads.stop && rbChosenMove != Move::none())
             {
-                // Map cp to [-1,1]; temperature 600 is a safe default
-                const double q = std::tanh(double(bestValue) / 600.0);
-                rbQ[0] = 0.7 * rbQ[0] + 0.3 * q; // EMA
-                rbN[0] += 1.0;
+                // Find chosen move's index in the *current* (post-sort) order
+                size_t idx = 0;
+                for (; idx < rootMoves.size(); ++idx)
+                    if (rootMoves[idx].pv[0] == rbChosenMove) break;
+                if (idx < rootMoves.size()) {
+                    Value v = rootMoves[idx].uciScore != -VALUE_INFINITE
+                                ? rootMoves[idx].uciScore
+                                : rootMoves[idx].score;
+                    // Map centipawns to [-1,1]; tanh smooths decisive scores
+                    const double q = std::tanh(double(v) / 600.0);
+                    rbQ[idx] = 0.7 * rbQ[idx] + 0.3 * q; // EMA
+                    rbN[idx] += 1.0;
+                }
             }
 
             // Sort the PV lines searched so far and update the GUI
