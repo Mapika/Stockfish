@@ -285,6 +285,7 @@ void Search::Worker::iterative_deepening() {
     // OFF by default; enabled with setoption name RootBandit value true
     const bool useRootBandit = bool(options["RootBandit"]);
     std::vector<double> rbPrior, rbN, rbQ;
+    std::vector<Move>   rbOrderBeforeSort;
 
     auto rb_reset_if_needed = [&]() {
         if (!useRootBandit) return;
@@ -312,6 +313,25 @@ void Search::Worker::iterative_deepening() {
             if (score > bestScore) { bestScore = score; best = i; }
         }
         return best;
+    };
+    auto rb_realign_after_sort = [&]() {
+        if (!useRootBandit || rbPrior.size() != rootMoves.size()) return;
+        // Map stats from order before sort -> new order after sort
+        std::vector<double> p2(rootMoves.size()), n2(rootMoves.size()), q2(rootMoves.size());
+        for (size_t i = 0; i < rootMoves.size(); ++i) {
+            Move m = rootMoves[i].pv[0];
+            size_t j = 0;
+            for (; j < rbOrderBeforeSort.size(); ++j)
+                if (rbOrderBeforeSort[j] == m) break;
+            if (j < rbOrderBeforeSort.size()) {
+                p2[i] = rbPrior[j]; n2[i] = rbN[j]; q2[i] = rbQ[j];
+            } else {
+                // New/unknown move: initialize conservatively
+                p2[i] = rootMoves.empty() ? 0.0 : 1.0 / double(rootMoves.size());
+                n2[i] = 0.0; q2[i] = 0.0;
+            }
+        }
+        rbPrior.swap(p2); rbN.swap(n2); rbQ.swap(q2);
     };
     // -------------------------------------------------------------------
 
@@ -357,8 +377,10 @@ void Search::Worker::iterative_deepening() {
                 const size_t chosen = rb_pick_ucb();
                 rb_rotate_front(chosen);
             }
-            // With bandit enabled and MultiPV==1, we restrict the searched set
-            // to the single chosen move by clamping pvLast below.
+            // IMPORTANT: Do *not* clamp the searched slice (pvFirst..pvLast).
+            // Stockfish uses that slice to implement UCI `searchmoves`. Clamping it to
+            // one move effectively forbids searching alternatives at the root, which is
+            // disastrous for AB. We only reorder to make our choice the TT move first.
 
             if (pvIdx == pvLast)
             {
@@ -368,8 +390,7 @@ void Search::Worker::iterative_deepening() {
                         break;
             }
 
-            if (useRootBandit && multiPV == 1)
-                pvLast = pvIdx + 1; // search only the selected front move this iteration
+            // Do not clamp pvLast when RootBandit is enabled.
 
             // Reset UCI info selDepth for each depth and each PV line
             selDepth = 0;
@@ -397,6 +418,13 @@ void Search::Worker::iterative_deepening() {
                 rootDelta = beta - alpha;
                 bestValue = search<Root>(rootPos, ss, alpha, beta, adjustedDepth, false);
 
+                // Save order before sorting to realign bandit stats to new order
+                if (useRootBandit && multiPV == 1) {
+                    rbOrderBeforeSort.clear();
+                    rbOrderBeforeSort.reserve(rootMoves.size());
+                    for (const auto& rm : rootMoves) rbOrderBeforeSort.push_back(rm.pv[0]);
+                }
+
                 // Bring the best move to the front. It is critical that sorting
                 // is done with a stable algorithm because all the values but the
                 // first and eventually the new best one is set to -VALUE_INFINITE
@@ -404,6 +432,8 @@ void Search::Worker::iterative_deepening() {
                 // new PV that goes to the front. Note that in the case of MultiPV
                 // search the already searched PV lines are preserved.
                 std::stable_sort(rootMoves.begin() + pvIdx, rootMoves.begin() + pvLast);
+                // Realign bandit stats vectors to the new rootMoves order
+                if (useRootBandit && multiPV == 1) rb_realign_after_sort();
 
                 // If search has been stopped, we break immediately. Sorting is
                 // safe because RootMoves is still valid, although it refers to
@@ -442,14 +472,12 @@ void Search::Worker::iterative_deepening() {
                 assert(alpha >= -VALUE_INFINITE && beta <= VALUE_INFINITE);
             }
 
-            // Bandit feedback: update Q,N for the chosen front move (index 0)
-            if (useRootBandit && multiPV == 1 && !threads.stop && !rootMoves.empty())
+            // Root bandit feedback: update Q,N for the chosen move (now at index 0)
+            if (useRootBandit && multiPV == 1 && !threads.stop && !is_decisive(bestValue) && !rootMoves.empty())
             {
-                // Map centipawn to [-1,1] with a gentle temperature (600 cp).
-                // Avoid pushing decisive TB/mate scores too hard; tanh smooths them.
-                double q = std::tanh(double(bestValue) / 600.0);
-                // Simple EMA for stability.
-                rbQ[0] = 0.7 * rbQ[0] + 0.3 * q;
+                // Map cp to [-1,1]; temperature 600 is a safe default
+                const double q = std::tanh(double(bestValue) / 600.0);
+                rbQ[0] = 0.7 * rbQ[0] + 0.3 * q; // EMA
                 rbN[0] += 1.0;
             }
 
